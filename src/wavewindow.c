@@ -26,6 +26,8 @@
 #define _ISOC99_SOURCE 1
 #endif
 #include <math.h>
+#include <string.h>
+#include <ctype.h>
 
 #define WAVE_CAIRO_050_OFFSET (GLOBALS->cairo_050_offset)
 
@@ -1620,6 +1622,370 @@ static gboolean wavearea_swipe_tick(GtkWidget *widget,
 
 #endif
 
+/* ========================================================================= */
+/* [SMART SEARCH & NAVIGATION FEATURES V8]                                   */
+/* Added by Custom Feature Implementation                                    */
+/* ========================================================================= */
+
+/* Forward declarations for GTKWave 4.0 API to circumvent header dependency */
+typedef struct _GwFacs GwFacs;
+extern GwFacs *gw_dump_file_get_facs(GwDumpFile *df);
+extern guint gw_facs_get_length(GwFacs *facs);
+extern GwSymbol *gw_facs_get(GwFacs *facs, guint n);
+
+/* Helper: Case-insensitive string search */
+static const char* my_strcasestr(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return haystack;
+    for (; *haystack; haystack++) {
+        if (tolower((unsigned char)*haystack) == tolower((unsigned char)*needle)) {
+            const char *h = haystack, *n = needle;
+            while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+                h++; n++;
+            }
+            if (*n == '\0') return haystack;
+        }
+    }
+    return NULL;
+}
+
+/* Helper: Extract leaf name from hierarchical path (e.g. top.sys.sig -> sig) */
+static char* get_leaf_name(const char *full_path) {
+    if (!full_path) return NULL;
+    const char *last_dot = strrchr(full_path, '.');
+    if (last_dot) {
+        return g_strdup(last_dot + 1);
+    }
+    return g_strdup(full_path);
+}
+
+/* Logic: Automatically select signal in the lower Signal List (dnd_sigview) */
+static gboolean deferred_signal_selection(gpointer user_data) {
+    char *target_signal_name = (char *)user_data;
+    if (!target_signal_name) return FALSE;
+
+    if (!GLOBALS->dnd_sigview) {
+        g_free(target_signal_name);
+        return FALSE;
+    }
+
+    GtkTreeView *tree_view = GTK_TREE_VIEW(GLOBALS->dnd_sigview);
+    GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+    if (!model) {
+        g_free(target_signal_name);
+        return FALSE;
+    }
+
+    GtkTreeIter iter;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+    gboolean found = FALSE;
+
+    while (valid) {
+        char *name = NULL;
+        gtk_tree_model_get(model, &iter, 0, &name, -1);
+
+        if (name) {
+            if (strcasecmp(name, target_signal_name) == 0) {
+                GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+                GtkTreePath *path = gtk_tree_model_get_path(model, &iter);
+
+                gtk_tree_selection_unselect_all(selection);
+                gtk_tree_selection_select_iter(selection, &iter);
+                gtk_tree_view_scroll_to_cell(tree_view, path, NULL, TRUE, 0.5, 0.0);
+
+                gtk_tree_path_free(path);
+                g_free(name);
+                found = TRUE;
+                break;
+            }
+            g_free(name);
+        }
+        valid = gtk_tree_model_iter_next(model, &iter);
+    }
+
+    if (found) {
+        printf(">>> [SignalList] Auto-selected signal: %s\n", target_signal_name);
+        gtk_widget_grab_focus(GTK_WIDGET(tree_view));
+    }
+    g_free(target_signal_name);
+    return FALSE;
+}
+
+/* Logic: Automatically expand path in the left SST (Hierarchy Tree) */
+static void highlight_sst_path(const char *full_path) {
+    if (!GLOBALS->treeview_main || !full_path) return;
+
+    GtkTreeView *tree_view = GTK_TREE_VIEW(GLOBALS->treeview_main);
+    GtkTreeModel *model = gtk_tree_view_get_model(tree_view);
+    if (!model) return;
+
+    char *path_copy = g_strdup(full_path);
+    char *token;
+    char *saveptr;
+    const char *delimiters = "./";
+
+    GtkTreeIter iter;
+    GtkTreeIter child;
+    gboolean valid = gtk_tree_model_get_iter_first(model, &iter);
+
+    if (!valid) { g_free(path_copy); return; }
+
+    token = strtok_r(path_copy, delimiters, &saveptr);
+    GtkTreePath *last_valid_path = NULL;
+
+    while (token != NULL) {
+        gboolean found_in_level = FALSE;
+        do {
+            char *node_name = NULL;
+            gtk_tree_model_get(model, &iter, 0, &node_name, -1);
+            if (node_name) {
+                if (strcasecmp(node_name, token) == 0) {
+                    found_in_level = TRUE;
+                    if (last_valid_path) gtk_tree_path_free(last_valid_path);
+                    last_valid_path = gtk_tree_model_get_path(model, &iter);
+                    gtk_tree_view_expand_row(tree_view, last_valid_path, FALSE);
+                    child = iter;
+                    g_free(node_name);
+                    break;
+                }
+                g_free(node_name);
+            }
+        } while (gtk_tree_model_iter_next(model, &iter));
+
+        if (!found_in_level) break;
+        token = strtok_r(NULL, delimiters, &saveptr);
+        if (token != NULL) {
+             if (!gtk_tree_model_iter_children(model, &iter, &child)) break;
+        }
+    }
+
+    if (last_valid_path) {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(tree_view);
+        gtk_tree_selection_unselect_all(selection);
+        gtk_tree_selection_select_path(selection, last_valid_path);
+        gtk_tree_view_scroll_to_cell(tree_view, last_valid_path, NULL, TRUE, 0.5, 0.0);
+        gtk_tree_path_free(last_valid_path);
+
+        printf(">>> [SST] Expanded path: %s\n", full_path);
+
+        /* Schedule lower list selection with 150ms delay for UI to refresh */
+        char *leaf_name = get_leaf_name(full_path);
+        g_timeout_add(150, deferred_signal_selection, leaf_name);
+    }
+    g_free(path_copy);
+}
+
+/* UI: Double click handler for multi-result list */
+static void on_result_list_row_activated(GtkTreeView *tree_view, GtkTreePath *path, GtkTreeViewColumn *column, gpointer user_data) {
+    (void)tree_view; (void)path; (void)column;
+    GtkDialog *dialog = GTK_DIALOG(user_data);
+    gtk_dialog_response(dialog, GTK_RESPONSE_ACCEPT);
+}
+
+/* UI: Multi-result selection dialog */
+static void show_result_selection_dialog(GSList *matches_list) {
+    if (!matches_list) return;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Select Signal",
+                                                    NULL,
+                                                    GTK_DIALOG_MODAL,
+                                                    "Select", GTK_RESPONSE_ACCEPT,
+                                                    "Cancel", GTK_RESPONSE_CANCEL,
+                                                    NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 600, 400);
+
+    GtkListStore *store = gtk_list_store_new(1, G_TYPE_STRING);
+    GtkTreeIter iter;
+
+    GSList *l;
+    for (l = matches_list; l != NULL; l = l->next) {
+        char *sig_name = (char *)l->data;
+        gtk_list_store_append(store, &iter);
+        gtk_list_store_set(store, &iter, 0, sig_name, -1);
+    }
+
+    GtkWidget *tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
+    GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+    GtkTreeViewColumn *column = gtk_tree_view_column_new_with_attributes("Matched Signals", renderer, "text", 0, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), column);
+
+    g_signal_connect(tree_view, "row-activated", G_CALLBACK(on_result_list_row_activated), dialog);
+
+    GtkWidget *scrolled_window = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_container_add(GTK_CONTAINER(scrolled_window), tree_view);
+
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_box_pack_start(GTK_BOX(content_area), scrolled_window, TRUE, TRUE, 0);
+
+    gtk_widget_show_all(dialog);
+
+    gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+
+    if (response == GTK_RESPONSE_ACCEPT) {
+        GtkTreeSelection *selection = gtk_tree_view_get_selection(GTK_TREE_VIEW(tree_view));
+        GtkTreeModel *model_out;
+        GtkTreeIter iter_out;
+
+        if (gtk_tree_selection_get_selected(selection, &model_out, &iter_out)) {
+            char *selected_path;
+            gtk_tree_model_get(model_out, &iter_out, 0, &selected_path, -1);
+
+            if (selected_path) {
+                printf(">>> [Popup] User selected: %s\n", selected_path);
+                highlight_sst_path(selected_path);
+                g_free(selected_path);
+            }
+        }
+    }
+
+    gtk_widget_destroy(dialog);
+    g_object_unref(store);
+}
+
+/* Logic: Main signal search router */
+static void perform_signal_search(GtkWidget *parent_widget, const char *search_text) {
+    (void)parent_widget;
+    if (!search_text || strlen(search_text) == 0) return;
+
+    printf("\n>>> [Search] Looking for: '%s' <<<\n", search_text);
+
+    /* Phase 1: Search within the currently added waveforms */
+    GwTrace *t = GLOBALS->traces.first;
+    int index = 0;
+    int found_in_wave = 0;
+
+    while (t) {
+        if (t->name && my_strcasestr(t->name, search_text)) {
+            found_in_wave = 1;
+            break;
+        }
+        index++;
+        t = t->t_next;
+    }
+
+    if (found_in_wave) {
+        printf(">>> [Search] Found in Wave Window (Index: %d)\n", index);
+        GtkAdjustment *vadj = gw_signal_list_get_vadjustment(GW_SIGNAL_LIST(GLOBALS->signalarea));
+        if (vadj) {
+            gtk_adjustment_set_value(vadj, index * GLOBALS->fontheight);
+        }
+        return;
+    }
+
+    /* Phase 2: Deep search in entire SST hierarchy */
+    printf(">>> [Search] Not in wave. Scanning full hierarchy...\n");
+
+    GSList *matches_list = NULL;
+    int match_count = 0;
+
+    if (GLOBALS->dump_file) {
+        GwFacs *facs = gw_dump_file_get_facs(GLOBALS->dump_file);
+        if (facs) {
+            guint total_signals = gw_facs_get_length(facs);
+            for (guint i = 0; i < total_signals; i++) {
+                GwSymbol *sym = gw_facs_get(facs, i);
+                if (sym && sym->name && my_strcasestr(sym->name, search_text)) {
+                    matches_list = g_slist_append(matches_list, g_strdup(sym->name));
+                    match_count++;
+                    /* Hard limit to prevent extreme memory usage or UI freezing */
+                    if (match_count >= 1000) break;
+                }
+            }
+        }
+    }
+
+    /* Phase 3: Route based on match count */
+    if (match_count == 0) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL, GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK, "Signal '%s' not found anywhere.", search_text);
+        g_signal_connect(dialog, "response", G_CALLBACK(gtk_widget_destroy), NULL);
+        gtk_widget_show(dialog);
+    }
+    else if (match_count == 1) {
+        char *only_match = (char *)matches_list->data;
+        highlight_sst_path(only_match);
+    }
+    else {
+        printf(">>> [Search] Found %d matches. Opening selector.\n", match_count);
+        show_result_selection_dialog(matches_list);
+    }
+
+    g_slist_free_full(matches_list, g_free);
+}
+
+/* UI: Callback for initial search dialog input */
+static void on_search_dialog_response(GtkDialog *dlg, int response_id, gpointer user_data) {
+    if (response_id == GTK_RESPONSE_ACCEPT) {
+        GtkWidget *entry = GTK_WIDGET(user_data);
+        perform_signal_search(GTK_WIDGET(dlg), gtk_entry_get_text(GTK_ENTRY(entry)));
+    }
+    gtk_widget_destroy(GTK_WIDGET(dlg));
+}
+
+/* UI: Launch the initial search dialog */
+static void show_search_dialog(void) {
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Find Signal (Auto-Expand)",
+                                                    NULL,
+                                                    GTK_DIALOG_MODAL,
+                                                    "Find", GTK_RESPONSE_ACCEPT,
+                                                    "Cancel", GTK_RESPONSE_CANCEL,
+                                                    NULL);
+
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *entry = gtk_entry_new();
+
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_box_pack_start(GTK_BOX(content), entry, TRUE, TRUE, 0);
+    gtk_widget_show_all(entry);
+
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+    g_signal_connect(dialog, "response", G_CALLBACK(on_search_dialog_response), entry);
+
+    gtk_widget_show(dialog);
+}
+
+/* Global Key Snooper for shortcut injection (OS Independent behavior) */
+static gint my_global_key_snooper(GtkWidget *grab_widget, GdkEventKey *event, gpointer func_data) {
+    (void)grab_widget; (void)func_data;
+
+    /* 1. Vim/Web style '/' key shortcut */
+    if (event->keyval == GDK_KEY_slash || event->keyval == GDK_KEY_question) {
+        /* Ignore if focus is already inside a text entry box */
+        if (GTK_IS_ENTRY(gtk_window_get_focus(GTK_WINDOW(gtk_widget_get_toplevel(grab_widget))))) return FALSE;
+        show_search_dialog();
+        return TRUE;
+    }
+
+    /* 2. Advanced Search Shortcut (Cmd+Shift+F on Mac, Ctrl+Shift+F on Windows/Linux) */
+#if defined(MAC_INTEGRATION) || defined(__APPLE__)
+    if ((event->state & GDK_MOD2_MASK) || (event->state & GDK_META_MASK)) {
+#else
+    if (event->state & GDK_CONTROL_MASK) {
+#endif
+        if (event->state & GDK_SHIFT_MASK) {
+            if (event->keyval == GDK_KEY_f || event->keyval == GDK_KEY_F) {
+                show_search_dialog();
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
+/* Mac-specific Pinch Zoom implementation handler */
+static void daniel_mac_pinch_zoom_callback(GtkGestureZoom *gesture, gdouble scale, gpointer user_data) {
+    (void)gesture; (void)user_data;
+    static gdouble last_scale = 1.0;
+    if (scale == 1.0) { last_scale = 1.0; return; }
+    if (fabs(scale - last_scale) > 0.02) {
+        if (scale > last_scale) alt_zoom_in(NULL, NULL);
+        else alt_zoom_out(NULL, NULL);
+        last_scale = scale;
+    }
+}
+
+
 GtkWidget *create_wavewindow(void)
 {
 #ifdef WAVE_GTK3_SIZE_ALLOCATE_WORKAROUND_DEPRECATED_API
@@ -1631,6 +1997,9 @@ GtkWidget *create_wavewindow(void)
     GLOBALS->wavearea = gw_wave_view_new();
     gtk_widget_set_hexpand(GLOBALS->wavearea, TRUE);
     gtk_widget_set_vexpand(GLOBALS->wavearea, TRUE);
+
+    /* Globally attach Key Snooper for Smart Search features */
+    gtk_key_snooper_install(my_global_key_snooper, NULL);
 
 #ifdef EXPERIMENTAL_PLUGIN_SUPPORT
     // TODO: Remove this hack! It doesn't support context changes and will update the waveform too
@@ -1667,6 +2036,10 @@ GtkWidget *create_wavewindow(void)
         gs = gtk_gesture_zoom_new(GLOBALS->wavearea);
         gtkwave_signal_connect(gs, "begin", G_CALLBACK(wavearea_zoom_begin_event), gs);
         gtkwave_signal_connect(gs, "end", G_CALLBACK(wavearea_zoom_end_event), gs);
+
+        /* Inject Custom Pinch Zoom support on standard platforms */
+        g_signal_connect(gs, "scale-changed", G_CALLBACK(daniel_mac_pinch_zoom_callback), NULL);
+
 #ifdef WAVE_GTK3_GESTURE_ZOOM_USES_GTK_PHASE_CAPTURE
         gtkwave_signal_connect(gs, "update", G_CALLBACK(wavearea_zoom_update_event), gs);
         gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(gs), GTK_PHASE_CAPTURE);
