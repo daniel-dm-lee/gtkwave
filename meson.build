@@ -2,7 +2,7 @@ project(
     'gtkwave',
     'c',
     'cpp',
-    version: '4.0.0-prealpha',
+    version: '4.0.0-prealpha-SiFive',
     default_options: [
         'buildtype=debugoptimized',
         'warning_level=2',
