@@ -1074,6 +1074,20 @@ void menu_quit_callback(GtkWidget *widget, gpointer data)
 #endif
         g_print("Exiting.\n");
 
+        /* [Auto-save] Force save on normal exit or dialog confirmation*/
+        if (GLOBALS->traces.first) {
+            const char *autosave_name = ".gtkwave_autosave.gtkw";
+            FILE *wave = fopen(autosave_name, "wb");
+            if (wave) {
+                /* Add 'const' to match the original declaration in savefile.h */
+                extern void write_save_helper(const char *wname, FILE *wave);
+                write_save_helper(autosave_name, wave); /* Removed (char *) cast */
+                fclose(wave);
+                printf(">>> [Auto-save] Current session backed up to %s\n", autosave_name);
+            }
+        }
+        /* ----------------------------------------------------- */
+
         exit(0);
     }
 }
@@ -5680,6 +5694,20 @@ int file_quit_cmd_callback(GtkWidget *widget, gpointer data)
 #ifdef __CYGWIN__
         kill_stems_browser();
 #endif
+        /* [Auto-save] Force save on forced exit via 'X' button or Cmd+Q (Fast Exit)  */
+        if (GLOBALS->traces.first) {
+            const char *autosave_name = ".gtkwave_autosave.gtkw";
+            FILE *wave = fopen(autosave_name, "wb");
+            if (wave) {
+                /* Add 'const' to match the original declaration in savefile.h */
+                extern void write_save_helper(const char *wname, FILE *wave);
+                write_save_helper(autosave_name, wave); /* Removed (char *) cast */
+                fclose(wave);
+                printf(">>> [Auto-save] Current session backed up to %s\n", autosave_name);
+            }
+        }
+        /*  --------------------------------------------------------------------------  */
+
         g_print("WM Destroy\n");
         exit(0);
     }

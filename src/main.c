@@ -78,7 +78,190 @@
 #include <gtkosxapplication.h>
 #endif
 
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+
 char *gtkwave_argv0_cached = NULL;
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>   /* For Non-blocking I/O */
+#include <unistd.h>  /* For read() */
+
+/* ========================================================================= */
+/* [SMART VCD CHECKER] Large VCD Detection and Auto FST Conversion Feature   */
+/* ========================================================================= */
+void check_and_prompt_vcd_conversion(int *argc, char ***argv) {
+    long long threshold = 500LL * 1024LL * 1024LL; /* Size threshold: 500MB */
+
+    for (int i = 1; i < *argc; i++) {
+        char *arg = (*argv)[i];
+
+        /* Check if the file extension is .vcd or .VCD */
+        if (arg && (strstr(arg, ".vcd") || strstr(arg, ".VCD"))) {
+
+            /* Use fopen and fseeko for safe >2GB/34GB+ file size checking */
+            FILE *fp_check = fopen(arg, "rb");
+            if (fp_check) {
+                fseeko(fp_check, 0, SEEK_END);
+                long long file_size = (long long)ftello(fp_check);
+                fclose(fp_check);
+
+                if (file_size > threshold) {
+                    double size_gb = (double)file_size / (1024.0 * 1024.0 * 1024.0);
+
+                    GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                        GTK_DIALOG_MODAL,
+                        GTK_MESSAGE_QUESTION,
+                        GTK_BUTTONS_YES_NO,
+                        "The VCD file is very large (%.2f GB).\n\nDo you want to convert it to FST for much faster loading and better performance?\n(This will automatically run 'vcd2fst' and open the FST file)",
+                        size_gb);
+
+                    gtk_window_set_title(GTK_WINDOW(dialog), "Large VCD Detected");
+
+                    /* --- Aggressive Focus Settings for macOS --- */
+                    /* 1. Set position to center for better visibility */
+                    gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER);
+                    /* 2. Force it to stay on top of all windows */
+                    gtk_window_set_keep_above(GTK_WINDOW(dialog), TRUE);
+                    /* 3. Send an urgency hint to the OS (makes icon bounce or forces focus) */
+                    gtk_window_set_urgency_hint(GTK_WINDOW(dialog), TRUE);
+                    /* 4. Present with current system time to bypass focus stealing prevention */
+                    gtk_window_present_with_time(GTK_WINDOW(dialog), GDK_CURRENT_TIME);
+                    /* -------------------------------------------- */
+
+                    int response = gtk_dialog_run(GTK_DIALOG(dialog));
+                    gtk_widget_destroy(dialog);
+
+                    /* If the user chooses YES (convert) */
+                    if (response == GTK_RESPONSE_YES) {
+                        char fst_file[4096];
+                        snprintf(fst_file, sizeof(fst_file), "%s", arg);
+
+                        char *ext = strstr(fst_file, ".vcd");
+                        if (!ext) ext = strstr(fst_file, ".VCD");
+                        if (ext) strcpy(ext, ".fst");
+
+                        GtkWidget *wait_dialog = gtk_dialog_new_with_buttons("Converting", NULL, GTK_DIALOG_MODAL, NULL);
+
+                        /* --- Aggressive Focus Settings --- */
+                        gtk_window_set_position(GTK_WINDOW(wait_dialog), GTK_WIN_POS_CENTER);
+                        gtk_window_set_keep_above(GTK_WINDOW(wait_dialog), TRUE);
+                        gtk_window_set_urgency_hint(GTK_WINDOW(wait_dialog), TRUE);
+                        gtk_window_present_with_time(GTK_WINDOW(wait_dialog), GDK_CURRENT_TIME);
+                        /* --------------------------------- */
+
+                        gtk_window_set_default_size(GTK_WINDOW(wait_dialog), 350, 100);
+                        GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(wait_dialog));
+
+                                                GtkWidget *label = gtk_label_new("Converting VCD to FST...\nPlease wait. This may take a while.");
+                        gtk_box_pack_start(GTK_BOX(content_area), label, TRUE, TRUE, 10);
+
+                        GtkWidget *progress = gtk_progress_bar_new();
+                        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(progress), "Converting...");
+                        gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(progress), TRUE);
+                        /* Set pulse step to control animation speed */
+                        gtk_progress_bar_set_pulse_step(GTK_PROGRESS_BAR(progress), 0.05);
+                        gtk_box_pack_start(GTK_BOX(content_area), progress, TRUE, TRUE, 10);
+
+                        gtk_widget_show_all(wait_dialog);
+
+                        char cmd[8192];
+                        snprintf(cmd, sizeof(cmd), "vcd2fst \"%s\" \"%s\" 2>&1", arg, fst_file);
+
+                        FILE *fp = popen(cmd, "r");
+                        int ret = -1;
+
+                        if (fp) {
+                            int fd = fileno(fp);
+                            /* Make the pipe NON-BLOCKING to prevent UI freeze */
+                            fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+                            char buf[512];
+                            while (1) {
+                                /* Attempt to read. If 0, it means EOF (process finished) */
+                                ssize_t n = read(fd, buf, sizeof(buf));
+                                if (n == 0) {
+                                    break; /* Conversion complete! */
+                                }
+
+                                /* Animate the progress bar back and forth */
+                                gtk_progress_bar_pulse(GTK_PROGRESS_BAR(progress));
+
+                                /* Process GTK events immediately to keep UI highly responsive */
+                                while (gtk_events_pending()) {
+                                    gtk_main_iteration();
+                                }
+
+                                /* Sleep 50ms to yield CPU and control animation frame rate */
+                                g_usleep(50000);
+                            }
+                            ret = pclose(fp);
+                        }
+
+                        gtk_widget_destroy(wait_dialog);
+
+                        /* Replace original argument so GTKWave opens the FST file */
+                        if (ret == 0) {
+                            (*argv)[i] = g_strdup(fst_file);
+                            printf(">>> [VCD to FST] Successfully converted and loaded %s\n", fst_file);
+                        } else {
+                            GtkWidget *err_dialog = gtk_message_dialog_new(NULL,
+                                GTK_DIALOG_MODAL,
+                                GTK_MESSAGE_ERROR,
+                                GTK_BUTTONS_OK,
+                                "Conversion failed. Opening original VCD instead.");
+                            gtk_dialog_run(GTK_DIALOG(err_dialog));
+                            gtk_widget_destroy(err_dialog);
+                        }
+                    }
+                    break; /* Break after handling the first large VCD */
+                }
+            }
+        }
+    }
+}
+/* ========================================================================= */
+
+/* ========================================================================= */
+/* [SESSION RESTORE] Check for autosave file and prompt for restoration      */
+/* ========================================================================= */
+void check_and_prompt_session_restore(void) {
+    const char *autosave_name = ".gtkwave_autosave.gtkw";
+    FILE *fp = fopen(autosave_name, "r");
+
+    if (fp) {
+        fclose(fp);
+
+        /* Create a dialog to ask the user */
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_QUESTION,
+            GTK_BUTTONS_YES_NO,
+            "A previous session backup was found.\n\nDo you want to restore the signals from your last session?");
+
+        gtk_window_set_title(GTK_WINDOW(dialog), "Restore Session?");
+
+        /* Force to front for macOS/iTerm focus issues */
+        gtk_window_set_keep_above(GTK_WINDOW(dialog), TRUE);
+        gtk_window_present_with_time(GTK_WINDOW(dialog), GDK_CURRENT_TIME);
+
+        int response = gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+
+        if (response == GTK_RESPONSE_YES) {
+            /* Use GTKWave's internal helper to read the save file */
+            printf(">>> [Session Restore] Restoring signals from %s\n", autosave_name);
+            read_save_helper((char *)autosave_name, NULL, NULL, NULL, NULL, NULL);
+        }
+    }
+}
+
 
 static void switch_page(GtkNotebook *notebook, gpointer *page, guint page_num, gpointer user_data)
 {
@@ -859,6 +1042,9 @@ int main_2(int opt_vcd, int argc, char *argv[])
             print_help(argv[0]);
         }
     }
+
+    /* ... (VCD conversion check) ... */
+    check_and_prompt_vcd_conversion(&argc, &argv);
 
     gboolean has_xpm_loader = FALSE;
 
@@ -2231,6 +2417,11 @@ savefile_bail:
             exit(255);
         }
     } else {
+
+        /* [Session Restore] Call this right before starting the GTK main loop
+     * to ensure all VCD/FST data and signal trees are fully loaded into memory. */
+        check_and_prompt_session_restore();
+
         gtk_main();
     }
 

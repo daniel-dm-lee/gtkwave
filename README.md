@@ -44,6 +44,7 @@ gtkwave [path to a .vcd, .fst, .ghw dump file or a .gtkw savefile]
 For more information about available command line parameters refer to the built in-help (`gtkwave --help`) or the [`gtkwave` man page](https://gtkwave.github.io/gtkwave/man/gtkwave.1.html).
 
 
+## NEW FEATURE #1
 ##  GTKWave Smart Search & Navigation Feature (Custom Fork)
 
 We have enhanced the traditional GTKWave 4.0 interface to include a modern, highly responsive "Smart Search" workflow. This allows developers to find deeply nested signals across expansive modules with a fraction of the effort previously required.
@@ -79,3 +80,57 @@ We have enhanced the traditional GTKWave 4.0 interface to include a modern, high
 3. Type `clk` and press **Enter**.
 4. If there are multiple different clocks, a prompt will let you pick the specific clock path.
 5. Select `top.cpu.clk`. The left tree will snap open, selecting `cpu`, and the bottom list will snap directly to `clk`.
+
+
+## NEW FEATURE #2
+###  Value Search (Right-Click Menu)
+
+A "Search Value Forward" feature has been added to the signal list context menu, allowing you to jump to specific data patterns instantly.
+
+1. **Context-Aware Searching**
+   - Simply **Right-Click** on any signal name (e.g., `rd_en` or `data_bus`).
+   - Select **"Search Value Forward..."** at the very top of the menu.
+
+2. **Advanced Search Engine**
+   - **Single Bit:** Search for `1`, `0`, `x`, or `z`.
+   - **Vectors/Buses:** Search for specific Hex, Decimal, or String values based on the current display format.
+   - **Directional:** The search starts from the current **Primary Marker** position (or the left edge of the screen if no marker is set) and moves forward in time.
+
+3. **Instant Navigation & Feedback**
+   - **Success:** The waveform automatically scrolls to the next occurrence, and the Primary Marker is snapped to the exact timestamp.
+   - **Clear Alerts:** If the value is not found in the remaining duration of the simulation, a dedicated popup dialog will notify the user.
+
+---
+
+## NEW FEATURE #3
+#### How to use:
+1. Right-click the signal `rd_en`.
+2. Click **"Search Value Forward..."**.
+3. Type `1` and press Enter.
+4. GTKWave will immediately jump to the next clock cycle where `rd_en` becomes high.
+
+
+### Large VCD to FST Auto-Conversion
+
+Handling massive VCD files (e.g., 30GB+) can heavily slow down GTKWave and consume excessive memory. This feature automatically detects large files and offers a seamless conversion to the highly optimized FST format before loading.
+
+1. **Smart Size Detection**
+   - Automatically detects if the input `.vcd` file size exceeds 500MB using 64-bit safe checks.
+2. **Interactive UI & Real-time Progress**
+   - Prompts the user with an "Always-on-top" dialog to perform the conversion.
+   - Displays a smooth, non-blocking progress bar while `vcd2fst` processes the file in the background (no UI freezing).
+3. **Automatic Loading**
+   - Once the conversion is complete, GTKWave silently swaps the target file and opens the lightweight `.fst` file instead.
+
+---
+
+## NEW FEATURE #4
+### Auto-Save & Session Restore
+
+No more losing your complex signal setups when you accidentally close GTKWave! This feature automatically backs up your workspace and asks if you want to restore it the next time you launch the application.
+
+1. **Seamless Auto-Save**
+   - Whenever you exit GTKWave (via menu, window close 'X' button, or `Cmd+Q`), your current signal traces and formats are silently saved to a `.gtkwave_autosave.gtkw` file.
+2. **Smart Restore Prompt**
+   - Upon launching GTKWave, if a previous session backup is detected, a priority popup dialog will ask if you want to restore it.
+   - Simply click **"Yes"** to instantly reload all your previously configured signals into the Time window.
