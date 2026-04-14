@@ -5756,8 +5756,14 @@ int set_wave_menu_accelerator(const char *str)
 /***********************/
 /*** popup menu code ***/
 /***********************/
+/* Forward declaration to prevent 'undeclared identifier' error */
+void menu_search_value_forward(gpointer null_data, guint callback_action, GtkWidget *widget);
 
 static gtkwave_mlist_t popmenu_items[] = {
+/* --- Add these two lines at the beginning --- */
+    WAVE_GTKIFE("/Search Value Forward...", NULL, menu_search_value_forward, 0, "<Item>"),
+    WAVE_GTKIFE("/<separator>", NULL, NULL, 0, "<Separator>"),
+    /* --------------------------------------------- */
     WAVE_GTKIFE("/Data Format/Hex", NULL, menu_dataformat_hex, WV_MENU_EDFH, "<Item>"),
     WAVE_GTKIFE("/Data Format/Decimal", NULL, menu_dataformat_dec, WV_MENU_EDFD, "<Item>"),
     WAVE_GTKIFE("/Data Format/Signed Decimal",
@@ -6468,3 +6474,143 @@ void wave_gtk_grab_remove(GtkWidget *w)
     osx_menu_sensitivity(TRUE);
 #endif
 }
+
+/* ========================================================================= */
+/* [CUSTOM ADDON] Search Value Forward Feature                               */
+/* ========================================================================= */
+
+/**
+ * Cleanup and search callback for the "Search Value Forward" dialog.
+ * This function performs the actual search on the trace data.
+ */
+/**
+ * Cleanup and search callback with UI feedback (Status text & Message dialog).
+ */
+static void search_value_cleanup(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data;
+
+    GwTrace *t = GLOBALS->trace_to_alias_menu_c_1;
+    if (!t || !GLOBALS->entrybox_text) return;
+
+    char *search_val = g_strdup(GLOBALS->entrybox_text); /* Copy search value for UI messages */
+    GwTime found_time = -1;
+    GwTime start_search_at;
+    char msg[512];
+
+    GwMarker *primary_marker = gw_project_get_primary_marker(GLOBALS->project);
+
+    if (gw_marker_is_enabled(primary_marker)) {
+        start_search_at = gw_marker_get_position(primary_marker) - t->shift;
+    } else {
+        start_search_at = GLOBALS->tims.start - t->shift;
+    }
+
+    /* --- Search Engine Start --- */
+    if (t->vector) {
+        GwVectorEnt *v = bsearch_vector(t->n.vec, start_search_at);
+        if (v && v->time <= start_search_at) v = v->next;
+        while (v) {
+            char *vstr = convert_ascii(t, v);
+            if (vstr) {
+                if (strstr(vstr, search_val) || strcasecmp(vstr, search_val) == 0) {
+                    found_time = v->time;
+                    free_2(vstr);
+                    break;
+                }
+                free_2(vstr);
+            }
+            v = v->next;
+        }
+    } else {
+        GwHistEnt *h = bsearch_node(t->n.nd, start_search_at);
+        if (h && h->time <= start_search_at) h = h->next;
+        while (h) {
+            char *hstr = NULL;
+            if (!t->n.nd->extvals) {
+                unsigned char h_val = h->v.h_val;
+                if (t->flags & TR_INVERT) h_val = gw_bit_invert(h_val);
+                hstr = (char*)calloc_2(1, 2);
+                hstr[0] = gw_bit_to_char(h_val);
+            } else {
+                if (h->flags & GW_HIST_ENT_FLAG_REAL) {
+                    hstr = (!(h->flags & GW_HIST_ENT_FLAG_STRING)) ?
+                           convert_ascii_real(t, &h->v.h_double) : convert_ascii_string((char *)h->v.h_vector);
+                } else {
+                    hstr = convert_ascii_vec(t, h->v.h_vector);
+                }
+            }
+            if (hstr) {
+                if (strstr(hstr, search_val) || strcasecmp(hstr, search_val) == 0) {
+                    found_time = h->time;
+                    free_2(hstr);
+                    break;
+                }
+                free_2(hstr);
+            }
+            h = h->next;
+        }
+    }
+    /* --- Search Engine End --- */
+
+    /* UI Feedback Logic */
+    if (found_time != (GwTime)-1) {
+        found_time += t->shift;
+        gw_marker_set_position(primary_marker, found_time);
+        gw_marker_set_enabled(primary_marker, TRUE);
+
+        GtkAdjustment *hadj = GTK_ADJUSTMENT(GLOBALS->wave_hslider);
+        gtk_adjustment_set_value(hadj, found_time);
+        GLOBALS->tims.timecache = found_time;
+        time_update();
+
+        /* 1. Show success in the bottom status bar */
+        snprintf(msg, sizeof(msg), "Search Success: Value '%s' found at time %lld.\n", search_val, (long long)found_time);
+        status_text(msg);
+    } else {
+        /* 1. Show failure in the bottom status bar */
+        snprintf(msg, sizeof(msg), "Search Failure: Value '%s' not found forward.\n", search_val);
+        status_text(msg);
+
+        /* 2. Show a popup dialog for failure so the user definitely knows */
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                                                GTK_DIALOG_MODAL,
+                                                GTK_MESSAGE_INFO,
+                                                GTK_BUTTONS_OK,
+                                                "Value '%s' not found in forward direction.", search_val);
+        gtk_window_set_title(GTK_WINDOW(dialog), "Search Result");
+        g_signal_connect(dialog, "response", G_CALLBACK(gtk_widget_destroy), NULL);
+        gtk_widget_show(dialog);
+    }
+
+    g_free(search_val);
+    if (GLOBALS->entrybox_text) { free_2(GLOBALS->entrybox_text); GLOBALS->entrybox_text = NULL; }
+    GLOBALS->signalwindow_width_dirty = 1;
+    redraw_signals_and_waves();
+}
+
+
+/**
+ * Main menu command to launch the search dialog.
+ */
+void menu_search_value_forward(gpointer null_data, guint callback_action, GtkWidget *widget) {
+    (void)null_data; (void)callback_action; (void)widget;
+    GwTrace *t = GLOBALS->traces.first;
+    GLOBALS->trace_to_alias_menu_c_1 = NULL;
+
+    if (GLOBALS->dnd_state) { dnd_error(); return; }
+
+    while (t) {
+        if (IsSelected(t)) {
+            GLOBALS->trace_to_alias_menu_c_1 = t;
+            break;
+        }
+        t = t->t_next;
+    }
+
+    if (GLOBALS->trace_to_alias_menu_c_1) {
+        entrybox("Search Value Forward", 300, "", "Value (e.g. 1, 0, Z, F):", 128, G_CALLBACK(search_value_cleanup));
+    } else {
+        status_text("Please select a signal (right-click) first.\n");
+    }
+}
+/* ========================================================================= */
