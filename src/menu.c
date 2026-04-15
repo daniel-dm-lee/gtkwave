@@ -41,6 +41,18 @@
 
 #undef WAVE_USE_MENU_BLACKOUTS
 
+/* Global handles for the persistent cycle monitor */
+static GtkWidget *cycle_monitor_win = NULL;
+static GtkWidget *cycle_monitor_label = NULL;
+static GwTrace   *cycle_monitor_target = NULL;
+static guint      cycle_monitor_timer_id = 0;
+
+/* Functions for real-time cycle counting */
+void menu_count_cycles_in_range(gpointer null_data, guint callback_action, GtkWidget *widget);
+static gboolean cycle_monitor_update_timer(gpointer data);
+static void on_cycle_monitor_destroy(GtkWidget *widget, gpointer data);
+
+
 static gtkwave_mlist_t menu_items[WV_MENU_NUMITEMS];
 static GtkWidget **menu_wlist = NULL;
 
@@ -5788,10 +5800,16 @@ int set_wave_menu_accelerator(const char *str)
 void menu_search_value_forward(gpointer null_data, guint callback_action, GtkWidget *widget);
 
 static gtkwave_mlist_t popmenu_items[] = {
-/* --- Add these two lines at the beginning --- */
+    /* --- Add these two lines at the beginning --- */
     WAVE_GTKIFE("/Search Value Forward...", NULL, menu_search_value_forward, 0, "<Item>"),
     WAVE_GTKIFE("/<separator>", NULL, NULL, 0, "<Separator>"),
     /* --------------------------------------------- */
+
+    /* --- Add mesurement menu for M1 and M2 --- */
+    WAVE_GTKIFE("/Count Cycles in Range (M1 to M2)", NULL, menu_count_cycles_in_range, 0, "<Item>"),
+    WAVE_GTKIFE("/<separator>", NULL, NULL, 0, "<Separator>"),
+    /* --------------------------------------------- */
+
     WAVE_GTKIFE("/Data Format/Hex", NULL, menu_dataformat_hex, WV_MENU_EDFH, "<Item>"),
     WAVE_GTKIFE("/Data Format/Decimal", NULL, menu_dataformat_dec, WV_MENU_EDFD, "<Item>"),
     WAVE_GTKIFE("/Data Format/Signed Decimal",
@@ -6640,5 +6658,169 @@ void menu_search_value_forward(gpointer null_data, guint callback_action, GtkWid
     } else {
         status_text("Please select a signal (right-click) first.\n");
     }
+}
+/* ========================================================================= */
+
+
+
+/* ========================================================================= */
+/* [CUSTOM ADDON] Real-time Cycle & Value Delta Monitor                      */
+/* ========================================================================= */
+/**
+ * Destructor to clean up timer when window is closed.
+ */
+static void on_cycle_monitor_destroy(GtkWidget *widget, gpointer data) {
+    (void)widget; (void)data;
+    if (cycle_monitor_timer_id) {
+        g_source_remove(cycle_monitor_timer_id);
+        cycle_monitor_timer_id = 0;
+    }
+    cycle_monitor_win = NULL;
+    cycle_monitor_target = NULL;
+}
+
+/**
+ * Real-time calculation logic (Called every 100ms).
+ */
+static gboolean cycle_monitor_update_timer(gpointer data) {
+    if (!cycle_monitor_win || !cycle_monitor_target) return FALSE;
+
+    GwMarker *pm = gw_project_get_primary_marker(GLOBALS->project);
+    GwMarker *bm = gw_project_get_baseline_marker(GLOBALS->project);
+
+    /* Check if markers are active */
+    if (!gw_marker_is_enabled(pm) || !gw_marker_is_enabled(bm)) {
+        gtk_label_set_markup(GTK_LABEL(cycle_monitor_label),
+            "<span foreground='#FF5555' size='large'><b>[ Wait: Set Markers ]</b></span>\n\n"
+            "Please set markers while this window is open:\n"
+            "1. <b>Left-Click</b> for M1\n2. <b>Middle-Click</b> for M2");
+        return TRUE;
+    }
+
+    GwTime t1 = gw_marker_get_position(pm);
+    GwTime t2 = gw_marker_get_position(bm);
+    GwTime start_t = (t1 < t2) ? t1 : t2;
+    GwTime end_t   = (t1 > t2) ? t1 : t2;
+
+    int cycles = 0;
+    char extra_info[512] = "";
+
+    /* 1. Logic for user-grouped Vectors */
+    if (cycle_monitor_target->vector) {
+        GwVectorEnt *v_start = bsearch_vector(cycle_monitor_target->n.vec, start_t);
+        GwVectorEnt *curr = v_start;
+        if (curr && curr->time <= start_t) curr = curr->next;
+        while (curr && curr->time <= end_t) {
+            cycles++;
+            curr = curr->next;
+        }
+    }
+    /* 2. Logic for Nodes (Single Bits AND Raw Multi-bit Buses like mcycle[63:0]) */
+    else {
+        GwHistEnt *h_start = bsearch_node(cycle_monitor_target->n.nd, start_t);
+        GwHistEnt *h_end   = bsearch_node(cycle_monitor_target->n.nd, end_t);
+
+        GwHistEnt *h = h_start;
+        if (h && h->time <= start_t) h = h->next;
+
+        while (h && h->time <= end_t) {
+            /* Check if it's a true single bit */
+            if (!cycle_monitor_target->n.nd->extvals) {
+                unsigned char val = h->v.h_val;
+                if (cycle_monitor_target->flags & TR_INVERT) val = gw_bit_invert(val);
+
+                /* Safe Guard: Prevent gw_bit_to_char assertion error */
+                if (val < GW_BIT_COUNT) {
+                    char c = gw_bit_to_char(val);
+                    /* Count Rising Edges */
+                    if (c == '1' || c == 'H' || c == 'h') cycles++;
+                }
+            } else {
+                /* It's a raw multi-bit bus: count value transitions */
+                cycles++;
+            }
+            h = h->next;
+        }
+
+        /* Extract Value Delta for multi-bit nodes */
+        if (cycle_monitor_target->n.nd->extvals && h_start && h_end) {
+            char *s_val = NULL;
+            char *e_val = NULL;
+
+            if (h_start->flags & GW_HIST_ENT_FLAG_REAL) {
+                s_val = (!(h_start->flags & GW_HIST_ENT_FLAG_STRING)) ? convert_ascii_real(cycle_monitor_target, &h_start->v.h_double) : convert_ascii_string((char *)h_start->v.h_vector);
+            } else {
+                s_val = convert_ascii_vec(cycle_monitor_target, h_start->v.h_vector);
+            }
+
+            if (h_end->flags & GW_HIST_ENT_FLAG_REAL) {
+                e_val = (!(h_end->flags & GW_HIST_ENT_FLAG_STRING)) ? convert_ascii_real(cycle_monitor_target, &h_end->v.h_double) : convert_ascii_string((char *)h_end->v.h_vector);
+            } else {
+                e_val = convert_ascii_vec(cycle_monitor_target, h_end->v.h_vector);
+            }
+
+            if (s_val && e_val) {
+                long long s_num = strtoll(s_val, NULL, 16);
+                long long e_num = strtoll(e_val, NULL, 16);
+                snprintf(extra_info, sizeof(extra_info), "\n\nStart Val: %s\nEnd Val: %s\nValue Delta: <span foreground='#00AAFF' size='large'><b>%lld</b></span>", s_val, e_val, e_num - s_num);
+                free_2(s_val); free_2(e_val);
+            }
+        }
+    }
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+        "<span size='medium'>Monitoring: <b>%s</b></span>\n\n"
+        "Time Range: %lld ~ %lld\n"
+        "Time Delta: <b>%lld</b>\n"
+        "Transitions/Edges: <span foreground='#00FF00' size='x-large'><b>%d</b></span>%s",
+        cycle_monitor_target->name, (long long)start_t, (long long)end_t,
+        (long long)(end_t - start_t), cycles, extra_info);
+
+    gtk_label_set_markup(GTK_LABEL(cycle_monitor_label), buf);
+    return TRUE;
+}
+
+/**
+ * Menu entry to launch or update the persistent monitor.
+ */
+void menu_count_cycles_in_range(gpointer null_data, guint callback_action, GtkWidget *widget) {
+    (void)null_data; (void)callback_action; (void)widget;
+
+    GwTrace *t = GLOBALS->traces.first;
+    while (t) {
+        if (IsSelected(t)) { cycle_monitor_target = t; break; }
+        t = t->t_next;
+    }
+
+    if (!cycle_monitor_target) {
+        status_text("Please select a signal first.\n");
+        return;
+    }
+
+    /* If window doesn't exist, create it */
+    if (!cycle_monitor_win) {
+        cycle_monitor_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(cycle_monitor_win), "Real-time Monitor");
+        gtk_window_set_default_size(GTK_WINDOW(cycle_monitor_win), 300, 200);
+        gtk_window_set_position(GTK_WINDOW(cycle_monitor_win), GTK_WIN_POS_CENTER);
+        gtk_window_set_keep_above(GTK_WINDOW(cycle_monitor_win), TRUE);
+        gtk_window_set_urgency_hint(GTK_WINDOW(cycle_monitor_win), TRUE);
+
+        cycle_monitor_label = gtk_label_new(NULL);
+        gtk_label_set_justify(GTK_LABEL(cycle_monitor_label), GTK_JUSTIFY_CENTER);
+        gtk_container_add(GTK_CONTAINER(cycle_monitor_win), cycle_monitor_label);
+
+        g_signal_connect(cycle_monitor_win, "destroy", G_CALLBACK(on_cycle_monitor_destroy), NULL);
+        gtk_widget_show_all(cycle_monitor_win);
+
+        /* Start timer to update every 100ms */
+        cycle_monitor_timer_id = g_timeout_add(100, cycle_monitor_update_timer, NULL);
+    }
+
+
+    /* Bring to front and update immediately */
+    gtk_window_present(GTK_WINDOW(cycle_monitor_win));
+    cycle_monitor_update_timer(NULL);
 }
 /* ========================================================================= */
