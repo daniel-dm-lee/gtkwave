@@ -134,3 +134,24 @@ No more losing your complex signal setups when you accidentally close GTKWave! T
 2. **Smart Restore Prompt**
    - Upon launching GTKWave, if a previous session backup is detected, a priority popup dialog will ask if you want to restore it.
    - Simply click **"Yes"** to instantly reload all your previously configured signals into the Time window.
+
+
+## NEW FEATURE #5
+###  Real-time Cycle & Value Delta Monitor (Verdi-style)
+
+Quickly measure time differences, count clock cycles, and calculate bus value changes between two points in time, just like Synopsys Verdi.
+
+1. **Real-time Non-blocking UI**
+   - The monitor window stays on top without freezing the main application.
+   - As you drag your markers (M1 and M2) across the waveform, the cycle counts and time delta update instantly in real-time.
+2. **Smart Signal Handling**
+   - **1-bit Signals (e.g., clk):** Automatically counts the number of rising edges ('1' or 'H') within the selected range.
+   - **Multi-bit Buses (e.g., mcycle):** Calculates the exact mathematical difference (Value Delta) between the start and end marker values.
+
+---
+
+####  How to use:
+1. Place the **Primary Marker (M1)** using `Left-Click`.
+2. Place the **Baseline Marker (M2)** using `Middle-Click` (or `Shift + Left-Click`).
+3. Right-click on a target signal (like `clk` or `mcycle`) and select **"Count Cycles in Range..."**.
+4. A persistent monitor window will appear. Leave it open and adjust your markers to see real-time updates!
